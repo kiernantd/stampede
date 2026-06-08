@@ -43,16 +43,19 @@ REST backend for a scalable event ticketing platform. Core design focus: correct
 | id | UUID (PK) | gen_random_uuid() |
 | seat_id | UUID FK(seats.id) NOT NULL | |
 | user_id | UUID FK(users.id) NOT NULL | |
+| status | VARCHAR(16) NOT NULL | 'held' / 'confirmed' / 'expired' / 'cancelled', default 'held' |
 | expires_at | TIMESTAMPTZ NOT NULL | now() + hold_ttl |
 | created_at | TIMESTAMPTZ NOT NULL | default now() |
 
 **Critical index:**
 ```sql
-CREATE UNIQUE INDEX uix_seat_holds_active
+CREATE UNIQUE INDEX IF NOT EXISTS udx_one_active_hold
     ON seat_holds(seat_id)
-    WHERE expires_at > now();
+    WHERE status IN ('held', 'confirmed');
 ```
-This prevents two concurrent holds for the same seat at the DB level (correctness backstop).
+Status-based predicate avoids volatile `now()` inside the index definition.
+The expiry cleanup job transitions stale 'held' rows to 'expired' so the index
+reflects reality. This prevents two concurrent active holds at the DB level.
 
 ### bookings
 | Column | Type | Notes |
@@ -82,37 +85,37 @@ A seat can be actively held **or** booked by at most one user at a time.
 ### Two-layer protection
 
 **Layer 1 — Redis distributed lock (fast path)**
-- Key: `lock:seat:{seat_id}`
-- Value: `{user_id}` (for owner verification)
-- TTL: matches hold duration (`SEAT_HOLD_TTL_SECONDS`, default 600)
-- Acquire: `SET lock:seat:{seat_id} {user_id} NX PX {ttl_ms}`
+- Key: `seat:{seat_id}`
+- Value: `{user_id}`
+- TTL: 5 seconds (covers the DB transaction; the hold record itself enforces longer exclusivity)
+- Acquire: `SET seat:{seat_id} {user_id} NX PX 5000`
 - On fail: immediate HTTP 409 — no DB round-trip
 - Purpose: fast rejection under contention; protects the DB from thundering-herd
 
 **Layer 2 — PostgreSQL (correctness backstop)**
-- `SELECT seat FOR UPDATE NOWAIT` — raises immediately if row locked
-- Partial unique index on `seat_holds(seat_id) WHERE expires_at > now()` — raises `IntegrityError` on duplicate insert
-- If either check fails, rollback and return 409
+- `SELECT seat FOR UPDATE NOWAIT` — raises `OperationalError` immediately if row locked
+- Partial unique index on `seat_holds(seat_id) WHERE status IN ('held', 'confirmed')` — raises `IntegrityError` on duplicate insert
+- If either check fails, rollback, release Redis lock, return 409
 - Purpose: prevents double-booking even if Redis lock expires during a slow transaction
 
 ### Seat hold flow
 ```
-1.  SET lock:seat:{seat_id} {user_id} NX PX {ttl_ms}
+1.  SET seat:{seat_id} {user_id} NX PX 5000
     └─ fail → 409 Conflict
 
 2.  BEGIN TRANSACTION
 3.  SELECT * FROM seats WHERE id = {seat_id} FOR UPDATE NOWAIT
-    └─ LockNotAvailable → rollback, release Redis lock, 409
+    └─ OperationalError (lock_not_available) → rollback, release Redis lock, 409
 
 4.  Assert seat.status == 'available'
     └─ fail → rollback, release Redis lock, 409
 
-5.  INSERT INTO seat_holds (seat_id, user_id, expires_at) VALUES (...)
-    └─ IntegrityError (partial unique) → rollback, release Redis lock, 409
+5.  INSERT INTO seat_holds (seat_id, user_id, status, expires_at) VALUES (...)
+    └─ IntegrityError (udx_one_active_hold) → rollback, release Redis lock, 409
 
 6.  UPDATE seats SET status = 'held' WHERE id = {seat_id}
 7.  COMMIT
-8.  Return 201 HoldOut
+8.  Return 200 HoldOut
 ```
 
 ### Booking flow (convert hold → booking)

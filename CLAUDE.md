@@ -1,4 +1,4 @@
-# Scalable Event Booking Backend
+c# Scalable Event Booking Backend
 
 REST API for a Ticketmaster alternative. Backend-only resume project emphasizing concurrency correctness.
 
